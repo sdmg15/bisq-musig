@@ -6,8 +6,8 @@ use bdk_electrum::BdkElectrumClient;
 use bdk_electrum::bdk_core::bitcoin::bip32::Xpriv;
 use bdk_electrum::electrum_client::Client;
 use bdk_wallet::bitcoin::{
-    Address, Amount, FeeRate, Network, OutPoint, Psbt, ScriptBuf, XOnlyPublicKey, absolute,
-    secp256k1,
+    Address, Amount, FeeRate, Network, OutPoint, Psbt, ScriptBuf, TapNodeHash, XOnlyPublicKey,
+    absolute, secp256k1,
 };
 use bdk_wallet::coin_selection::CoinSelectionAlgorithm;
 use bdk_wallet::descriptor::{Descriptor, ExtendedDescriptor};
@@ -54,7 +54,7 @@ pub trait ProtocolWalletApi {
 
     // Import an external private from the HD wallet
     // After importing a rescan should be triggered
-    fn import_private_key(&mut self, pk: Scalar);
+    fn import_private_key(&mut self, pk: Scalar, merkle_root: Option<TapNodeHash>);
 }
 
 pub struct MemWallet {
@@ -80,11 +80,6 @@ impl MemWallet {
 
         let network: Network = Network::Regtest;
         let xprv: Xpriv = Xpriv::new_master(network, &seed)?;
-        tracing::info!(
-            "Generated Master Private Key:\n{xprv}\nWarning: be very careful with private \
-            keys when using MainNet! We are logging these values for convenience only because this \
-            is an example on RegTest.\n"
-        );
 
         let (descriptor, external_map, _) = Bip86(xprv, KeychainKind::External)
             .build(network.into())
@@ -201,7 +196,7 @@ impl ProtocolWalletApi for MemWallet {
         self.wallet.sign_selected_inputs(psbt, is_selected)
     }
 
-    fn import_private_key(&mut self, _pk: Scalar) {
+    fn import_private_key(&mut self, _pk: Scalar, _mr: Option<TapNodeHash>) {
         // `MemWallet` is an in-memory wallet that doesn't currently support imported keys.
         // If/when this is needed, mirror the `BMPWallet` implementation.
         todo!("MemWallet does not yet support importing private keys")
@@ -244,7 +239,7 @@ impl ProtocolWalletApi for Wallet {
         })
     }
 
-    fn import_private_key(&mut self, _pk: Scalar) {
+    fn import_private_key(&mut self, _pk: Scalar, _mr: Option<TapNodeHash>) {
         unimplemented!(
             "bdk_wallet::Wallet does not support importing external private keys; \
             use BMPWallet for that"

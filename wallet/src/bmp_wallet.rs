@@ -1,5 +1,6 @@
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
+use std::str::FromStr as _;
 use std::{fs, vec};
 
 use base64::Engine as _;
@@ -8,7 +9,8 @@ use bdk_electrum::bdk_core::bitcoin::{Address, FeeRate, OutPoint};
 use bdk_wallet::bitcoin::bip32::Xpriv;
 use bdk_wallet::bitcoin::hex::DisplayHex as _;
 use bdk_wallet::bitcoin::{
-    Amount, Network, PrivateKey, Psbt, ScriptBuf, Sequence, Weight, XOnlyPublicKey, psbt,
+    Amount, Network, PrivateKey, Psbt, ScriptBuf, Sequence, TapNodeHash, Weight, XOnlyPublicKey,
+    psbt,
 };
 use bdk_wallet::chain::Merge as _;
 use bdk_wallet::keys::bip39::Mnemonic;
@@ -20,6 +22,7 @@ use bdk_wallet::{
     AddressInfo, Balance, ChangeSet, KeychainKind, PersistedWallet, SignOptions, TxBuilder, Utxo,
     Wallet, WalletPersister, WeightedUtxo,
 };
+use hex::ToHex as _;
 use rand::RngCore as _;
 use secp::Scalar;
 
@@ -48,12 +51,15 @@ pub trait BMPWalletPersister: WalletPersister {
         seed_phrase: &str,
     ) -> anyhow::Result<()>;
 
-    fn load_imported_keys(db: &mut Self::DB, keys_table_name: &str) -> anyhow::Result<Vec<Scalar>>;
+    fn load_imported_keys(
+        db: &mut Self::DB,
+        keys_table_name: &str,
+    ) -> anyhow::Result<Vec<(Scalar, Option<TapNodeHash>)>>;
 
     fn persist_imported_keys(
         db: &mut Self::DB,
         keys_table_name: &str,
-        keys: &[Scalar],
+        keys: &[(Scalar, Option<TapNodeHash>)],
     ) -> anyhow::Result<()>;
 
     fn get_seed_phrase(db: &Self::DB, seeds_table_name: &str) -> anyhow::Result<String>;
@@ -86,7 +92,8 @@ impl BMPWalletPersister for Connection {
     ) -> anyhow::Result<()> {
         let create_imported_keys_table = format!(
             "CREATE TABLE {} ( \
-                    key TEXT PRIMARY KEY NOT NULL
+                    key TEXT PRIMARY KEY NOT NULL,
+                    merkle_root TEXT
                 ) STRICT",
             imported_keys_table.unwrap(),
         );
@@ -127,17 +134,35 @@ impl BMPWalletPersister for Connection {
         Ok(())
     }
 
-    fn load_imported_keys(db: &mut Self::DB, keys_table_name: &str) -> anyhow::Result<Vec<Scalar>> {
-        let mut imported_keys: Vec<Scalar> = vec![];
+    fn load_imported_keys(
+        db: &mut Self::DB,
+        keys_table_name: &str,
+    ) -> anyhow::Result<Vec<(Scalar, Option<TapNodeHash>)>> {
+        let mut imported_keys: Vec<(Scalar, Option<TapNodeHash>)> = vec![];
 
-        let mut statement = db.prepare(&format!("SELECT key FROM {keys_table_name}"))?;
+        let mut statement =
+            db.prepare(&format!("SELECT key, merkle_root FROM {keys_table_name}"))?;
 
-        let row_iter = statement.query_map([], |row| Ok((row.get::<_, String>("key")?,)))?;
+        let row_iter = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>("key")?,
+                row.get::<_, Option<String>>("merkle_root")?,
+            ))
+        })?;
 
         for row in row_iter {
-            let hex_key = row?;
-            let secret = Scalar::from_hex(&hex_key.0)?;
-            imported_keys.push(secret);
+            let (key_str, merkle_opt) = row?;
+            let secret = Scalar::from_hex(&key_str)?;
+
+            match merkle_opt {
+                Some(ref s) if !s.is_empty() => {
+                    let tph = TapNodeHash::from_str(s)?;
+                    imported_keys.push((secret, Some(tph)));
+                }
+                _ => {
+                    imported_keys.push((secret, None));
+                }
+            }
         }
 
         Ok(imported_keys)
@@ -146,17 +171,23 @@ impl BMPWalletPersister for Connection {
     fn persist_imported_keys(
         db: &mut Self::DB,
         keys_table_name: &str,
-        keys: &[Scalar],
+        keys: &[(Scalar, Option<TapNodeHash>)],
     ) -> anyhow::Result<()> {
         let db_trx = db.transaction()?;
         {
             let mut statement = db_trx.prepare_cached(&format!(
-                "INSERT OR IGNORE INTO {keys_table_name} (key) VALUES (:key)"
+                "INSERT OR IGNORE INTO {keys_table_name} (key, merkle_root) VALUES (:key, :m_root)"
             ))?;
 
             for key in keys {
+                let root = if let Some(h) = key.1 {
+                    h.encode_hex()
+                } else {
+                    String::new()
+                };
                 statement.execute(named_params! {
-                    ":key": key.serialize().to_lower_hex_string()
+                    ":key": key.0.serialize().to_lower_hex_string(),
+                    ":m_root": root,
                 })?;
             }
         }
@@ -180,7 +211,7 @@ const STOP_GAP: usize = 50;
 
 pub struct BMPWallet<P: BMPWalletPersister> {
     wallet: PersistedWallet<P>,
-    imported_keys: Vec<Scalar>,
+    imported_keys: Vec<(Scalar, Option<TapNodeHash>)>,
     imported_balance: Balance,
     signers_loaded: bool,
     db: P,
@@ -230,8 +261,8 @@ impl BMPWallet<Connection> {
 
     // Import an external private from the HD wallet
     // After importing a rescan should be triggered
-    pub fn import_private_key(&mut self, pk: Scalar) {
-        self.imported_keys.push(pk);
+    pub fn import_private_key(&mut self, pk: Scalar, merkle_root: Option<TapNodeHash>) {
+        self.imported_keys.push((pk, merkle_root));
     }
 
     fn imported_utxos(&self) -> Vec<WeightedUtxo> {
@@ -246,7 +277,7 @@ impl BMPWallet<Connection> {
                     .imported_keys
                     .iter()
                     .map(|scalar| {
-                        let pbk = scalar.base_point_mul().serialize_xonly();
+                        let pbk = scalar.0.base_point_mul().serialize_xonly();
                         XOnlyPublicKey::from_slice(&pbk).expect("Should be valid xonly pubkey")
                     })
                     .find(|pubkey| {
@@ -320,8 +351,8 @@ impl ProtocolWalletApi for BMPWallet<Connection> {
 
     // Import an external private from the HD wallet
     // After importing a rescan should be triggered
-    fn import_private_key(&mut self, pk: Scalar) {
-        self.import_private_key(pk);
+    fn import_private_key(&mut self, pk: Scalar, merkle_root: Option<TapNodeHash>) {
+        self.import_private_key(pk, merkle_root);
     }
 }
 
@@ -362,14 +393,14 @@ pub trait WalletApi {
 }
 
 pub fn get_imported_wallets(
-    imported_keys: &Vec<Scalar>,
+    imported_keys: &Vec<(Scalar, Option<TapNodeHash>)>,
     db: &Connection,
     network: Network,
     db_name: &str,
 ) -> anyhow::Result<Vec<(PersistedWallet<Connection>, Connection)>> {
     let mut res = vec![];
     for key in imported_keys {
-        let pubk = key.base_point_mul();
+        let pubk = key.0.base_point_mul();
         let pubk = pubk.serialize_xonly().to_lower_hex_string();
         let path_str = db
             .path()
@@ -417,6 +448,8 @@ impl WalletApi for BMPWallet<Connection> {
         let mut final_imported_balance = Balance::default();
 
         // For having accurate Wallet::calculate_fee and Wallet::calculate_fee_rate
+        // This is also at same time a way to have to UTXOs of the imported merged
+        // into the main wallet, allowing easy manipulation during coinselection
         for (w, _) in &imported {
             for utxo in w.list_unspent() {
                 self.insert_txout(utxo.outpoint, utxo.txout);
@@ -516,10 +549,10 @@ impl WalletApi for BMPWallet<Connection> {
         let secp = self.secp_ctx();
         let is_mine = |input_script: &ScriptBuf| {
             for key in &self.imported_keys {
-                let xonly_pubkey = key.base_point_mul().serialize_xonly();
+                let xonly_pubkey = key.0.base_point_mul().serialize_xonly();
                 let xonly_pubkey = XOnlyPublicKey::from_slice(&xonly_pubkey)
                     .expect("Should be valid xonly pubkey");
-                let script = ScriptBuf::new_p2tr(secp, xonly_pubkey, None);
+                let script = ScriptBuf::new_p2tr(secp, xonly_pubkey, key.1);
 
                 if script == *input_script {
                     return Some(*key);
@@ -532,7 +565,7 @@ impl WalletApi for BMPWallet<Connection> {
             let txout = input_details.witness_utxo.as_ref().unwrap();
 
             if let Some(signing_key) = is_mine(&txout.script_pubkey) {
-                let signer = PrivateKey::from_slice(&signing_key.serialize(), self.network())
+                let signer = PrivateKey::from_slice(&signing_key.0.serialize(), self.network())
                     .map_err(|_e| SignerError::External("Invalid signing key".to_owned()))?;
 
                 let sw = SignerWrapper::new(
@@ -586,7 +619,6 @@ impl WalletApi for BMPWallet<Connection> {
     fn load_wallet(path: &Path, network: Network, password: &str) -> anyhow::Result<Self> {
         let (salt, mut db) = {
             let p = path.join(Self::DB_NAME);
-            println!("Path set joining .. {}", p.display());
             (
                 get_salt(p.to_str().expect("Path must not be empty"))?,
                 Connection::open(p)?,
@@ -694,9 +726,13 @@ mod tests {
     use std::str::FromStr as _;
 
     use bdk_kyoto::FeeRate;
-    use bdk_kyoto::bip157::tokio;
+    use bdk_kyoto::bip157::{ScriptBuf, tokio};
     use bdk_wallet::bitcoin::hashes::Hash as _;
-    use bdk_wallet::bitcoin::{Address, AddressType, Amount, BlockHash, Network, Weight, psbt};
+    use bdk_wallet::bitcoin::key::Secp256k1;
+    use bdk_wallet::bitcoin::{
+        Address, AddressType, Amount, BlockHash, Network, OutPoint, TapNodeHash, TxOut, Weight,
+        psbt,
+    };
     use bdk_wallet::chain::{self, BlockId};
     use bdk_wallet::test_utils::{ReceiveTo, receive_output_to_address};
     use bdk_wallet::{AddressInfo, KeychainKind, SignOptions};
@@ -801,8 +837,8 @@ mod tests {
         let pk1 = new_private_key();
         let pk2 = new_private_key();
 
-        bmp_wallet.import_private_key(pk1);
-        bmp_wallet.import_private_key(pk2);
+        bmp_wallet.import_private_key(pk1, None);
+        bmp_wallet.import_private_key(pk2, None);
 
         assert_eq!(bmp_wallet.imported_keys.len(), 2);
 
@@ -810,6 +846,36 @@ mod tests {
         bmp_wallet.persist()?;
         let loaded_wallet = BMPWallet::load_wallet(dir.path(), Network::Regtest, "")?;
         assert_eq!(loaded_wallet.imported_keys, bmp_wallet.imported_keys);
+        Ok(())
+    }
+
+    #[test]
+    fn test_imported_keys_with_merkle_root() -> anyhow::Result<()> {
+        let dir = get_dir();
+        let mut bmp_wallet = BMPWallet::new(dir.path(), "", Network::Regtest)?;
+        let pk = new_private_key();
+
+        // Create a sample merkle root (32 bytes hex)
+        let merkle_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let merkle = TapNodeHash::from_str(merkle_hex)?;
+
+        bmp_wallet.import_private_key(pk, Some(merkle));
+
+        assert_eq!(bmp_wallet.imported_keys.len(), 1);
+
+        // Persist
+        bmp_wallet.persist()?;
+        let loaded_wallet = BMPWallet::load_wallet(dir.path(), Network::Regtest, "")?;
+
+        assert_eq!(loaded_wallet.imported_keys.len(), 1);
+
+        let (loaded_pk, loaded_merkle_opt) = &loaded_wallet.imported_keys[0];
+        assert_eq!(loaded_pk, &pk);
+        let loaded_merkle = loaded_merkle_opt
+            .as_ref()
+            .expect("merkle root should be present");
+        assert_eq!(loaded_merkle.to_string(), merkle_hex);
+
         Ok(())
     }
 
@@ -839,8 +905,8 @@ mod tests {
         let dir = get_dir();
         let mut bmp_wallet = BMPWallet::new(dir.path(), "", Network::Regtest)?;
 
-        bmp_wallet.import_private_key(pk1);
-        bmp_wallet.import_private_key(pk2);
+        bmp_wallet.import_private_key(pk1, None);
+        bmp_wallet.import_private_key(pk2, None);
 
         assert_eq!(bmp_wallet.imported_keys.len(), 2);
 
@@ -899,7 +965,7 @@ mod tests {
 
         let keys_to_import = [new_private_key(), new_private_key()];
         for k in &keys_to_import {
-            bmp_wallet.import_private_key(*k);
+            bmp_wallet.import_private_key(*k, None);
         }
 
         tracing::info!("Wallet balance before syncing {}", bmp_wallet.balance());
@@ -962,6 +1028,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sign_with_imported_key_merkle_root() -> anyhow::Result<()> {
+        let dir = get_dir();
+        let mut bmp_wallet = BMPWallet::new(dir.path(), "", Network::Regtest)?;
+
+        let pk = new_private_key();
+
+        // Example merkle root hex (32 bytes)
+        let merkle_hex = "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd";
+        let merkle = TapNodeHash::from_str(merkle_hex)?;
+
+        // Import private key with merkle root
+        bmp_wallet.import_private_key(pk, Some(merkle));
+
+        // Build a tx consuming a foreign utxo that pays to tr(pubkey, merkle_root)
+        let secp = Secp256k1::new();
+        let xonly = derive_public_key(&pk);
+
+        let outpoint = OutPoint::from_str(
+            "0000000000000000000000000000000000000000000000000000000000000001:0",
+        )?;
+
+        let txout = TxOut {
+            value: Amount::ONE_BTC,
+            script_pubkey: ScriptBuf::new_p2tr(&secp, xonly, Some(merkle)),
+        };
+
+        let mut psbt_input = psbt::Input {
+            witness_utxo: Some(txout.clone()),
+            tap_internal_key: Some(xonly),
+            ..Default::default()
+        };
+        psbt_input.tap_merkle_root = Some(merkle);
+
+        let mut tx_builder = bmp_wallet.build_tx();
+        tx_builder
+            .add_foreign_utxo(outpoint, psbt_input, Weight::from_wu(66))
+            .unwrap();
+
+        // Add a recipient so transaction can be built
+        let to_address = "tb1pyfv094rr0vk28lf8v9yx3veaacdzg26ztqk4ga84zucqqhafnn5q9my9rz";
+        let to_address = to_address.parse::<Address<_>>()?.assume_checked();
+        tx_builder.add_recipient(to_address, Amount::from_sat(100_000));
+
+        let mut res_psbt = tx_builder.finish()?;
+
+        bmp_wallet.sign(&mut res_psbt, SignOptions::default())?;
+
+        assert!(
+            res_psbt
+                .inputs
+                .iter()
+                .all(|i| i.final_script_witness.is_some())
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_selection_with_main_and_imported() -> anyhow::Result<()> {
         let client = MockedBDKElectrum {};
         let dir = get_dir();
@@ -977,8 +1101,8 @@ mod tests {
             186, 216, 94, 123, 55, 23, 125, 232, 214, 160, 33, 172, 124, 61,
         ];
 
-        bmp_wallet.import_private_key(Scalar::from_slice(&pk1).unwrap());
-        bmp_wallet.import_private_key(Scalar::from_slice(&pk2).unwrap());
+        bmp_wallet.import_private_key(Scalar::from_slice(&pk1).unwrap(), None);
+        bmp_wallet.import_private_key(Scalar::from_slice(&pk2).unwrap(), None);
 
         bmp_wallet.sync_all(&client).await?;
 
@@ -1047,8 +1171,8 @@ mod tests {
         let dir = get_dir();
         let mut bmp_wallet = BMPWallet::new(dir.path(), "", Network::Regtest)?;
 
-        bmp_wallet.import_private_key(pk1);
-        bmp_wallet.import_private_key(pk2);
+        bmp_wallet.import_private_key(pk1, None);
+        bmp_wallet.import_private_key(pk2, None);
 
         assert_eq!(bmp_wallet.imported_keys.len(), 2);
 
