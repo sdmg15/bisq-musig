@@ -20,6 +20,10 @@ zeroize = { workspace = true }
 thiserror = { workspace = true }
 trait-variant = { workspace = true }
 
+[features]
+# Extra introspection helpers for tests in downstream crates; not part of the normal public API.
+test-utils = []
+
 [dev-dependencies]
 bdk_wallet = { workspace = true, features = ["test-utils"] }
 bmp_tracing = { workspace = true }

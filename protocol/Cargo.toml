@@ -17,6 +17,7 @@ wallet = { workspace = true }
 
 [dev-dependencies]
 bdk_wallet = { workspace = true, features = ["test-utils"] }
+wallet = { workspace = true, features = ["test-utils"] }
 bdk_electrum = { workspace = true }
 bmp_tracing = { workspace = true }
 const_format = { workspace = true }

@@ -46,7 +46,7 @@ async fn test_sync_with_imported_keys() -> anyhow::Result<()> {
     let receive_amount = Amount::from_sat(100_000);
 
     let mut wallet = BMPWallet::new(env.new_temp_path(), "", Network::Regtest)?;
-    wallet.import_private_key(prv_key, None);
+    wallet.import_private_key(prv_key, None)?;
 
     let receiving_addr = wallet.next_unused_address(KeychainKind::External);
 
@@ -74,7 +74,7 @@ async fn test_broadcast_transaction() -> anyhow::Result<()> {
     // the test can keep mutating `env`.
     let dir = env.new_temp_path().to_path_buf();
     let mut wallet = BMPWallet::new(&dir, "", Network::Regtest)?;
-    wallet.import_private_key(prv_key, None);
+    wallet.import_private_key(prv_key, None)?;
 
     let receive_amount = Amount::from_sat(100_000);
     let to_address =
@@ -124,7 +124,7 @@ async fn test_broadcast_transaction_two() -> anyhow::Result<()> {
     // See note in `test_broadcast_transaction` re: binding the temp dir once.
     let dir = env.new_temp_path().to_path_buf();
     let mut wallet = BMPWallet::new(&dir, "", Network::Regtest)?;
-    wallet.import_private_key(prv_key, None);
+    wallet.import_private_key(prv_key, None)?;
 
     let receive_amount = Amount::from_sat(100_000);
     let to_address =
@@ -173,7 +173,7 @@ async fn test_broadcast_transaction_three() -> anyhow::Result<()> {
     // See note in `test_broadcast_transaction` re: binding the temp dir once.
     let dir = env.new_temp_path().to_path_buf();
     let mut wallet = BMPWallet::new(&dir, "", Network::Regtest)?;
-    wallet.import_private_key(prv_key, None);
+    wallet.import_private_key(prv_key, None)?;
 
     let main_wallet_addr = wallet.next_unused_address(KeychainKind::External);
 
@@ -248,7 +248,7 @@ async fn test_cbf_imported() -> anyhow::Result<()> {
 
     let prv_keys = [new_private_key(), new_private_key(), new_private_key()];
     for e in &prv_keys {
-        wallet.import_private_key(*e, None);
+        wallet.import_private_key(*e, None)?;
     }
     for e in &prv_keys {
         env.fund_from_prv_key(e, Amount::from_sat(10_000)).unwrap();
@@ -278,7 +278,7 @@ async fn test_cbf_imported_and_main() -> anyhow::Result<()> {
 
     let prv_keys = [new_private_key(), new_private_key(), new_private_key()];
     for e in &prv_keys {
-        wallet.import_private_key(*e, None);
+        wallet.import_private_key(*e, None)?;
     }
     for e in &prv_keys {
         env.fund_from_prv_key(e, Amount::from_sat(10_000)).unwrap();
@@ -367,7 +367,7 @@ async fn test_drain_wallet_with_main_balance() -> anyhow::Result<()> {
 
     let prv_keys = [new_private_key(), new_private_key()];
     for e in &prv_keys {
-        wallet.import_private_key(*e, None);
+        wallet.import_private_key(*e, None)?;
     }
     for e in &prv_keys {
         env.fund_from_prv_key(e, amount_to_send_imported).unwrap();

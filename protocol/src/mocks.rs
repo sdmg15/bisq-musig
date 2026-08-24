@@ -3,10 +3,10 @@ use std::collections::BTreeMap;
 use bdk_wallet::bitcoin::taproot::Signature;
 use bdk_wallet::bitcoin::transaction::Version;
 use bdk_wallet::bitcoin::{
-    Address, Amount, FeeRate, Network, OutPoint, Psbt, ScriptBuf, Sequence, TapNodeHash,
-    TapSighashType, Transaction, TxIn, TxOut, VarInt, Weight, Witness, XOnlyPublicKey, absolute,
-    psbt,
+    Address, Amount, FeeRate, Network, OutPoint, Psbt, ScriptBuf, Sequence, TapSighashType,
+    Transaction, TxIn, TxOut, VarInt, Weight, Witness, XOnlyPublicKey, absolute, psbt,
 };
+use bdk_wallet::miniscript::descriptor::TapTree;
 use musig2::secp::Scalar;
 use wallet::protocol_wallet_api::{ProtocolWalletApi, WalletErrorKind};
 
@@ -144,7 +144,11 @@ impl<Cs: Iterator<Item = TxOutput>, As: Iterator<Item = Address>> ProtocolWallet
         Ok(())
     }
 
-    fn import_private_key(&mut self, _pk: Scalar, _mr: Option<TapNodeHash>) {
+    fn import_private_key(
+        &mut self,
+        _pk: Scalar,
+        _tap_tree: Option<TapTree<XOnlyPublicKey>>,
+    ) -> Result<(), WalletErrorKind> {
         unimplemented!("MockTradeWallet does not support importing private keys")
     }
 }

@@ -4,16 +4,17 @@ use bdk_wallet::bitcoin;
 use bdk_wallet::rusqlite::Connection;
 use bitcoin::key::{Keypair, Secp256k1, TapTweak as _, TweakedKeypair, TweakedPublicKey};
 use bitcoin::secp256k1::Message;
-use bitcoin::{Amount, FeeRate, Network, TapSighashType};
+use bitcoin::{Amount, FeeRate, Network, TapSighashType, XOnlyPublicKey};
 use bmp_tracing::tracing;
 use musig2::KeyAggContext;
-use musig2::secp::Point;
+use musig2::secp::{Point, Scalar};
 use protocol::protocol_musig_adaptor::{BMPContext, BMPProtocol, BoxedTradeWallet, ProtocolRole};
+use protocol::script_paths::{deposit_payout_descriptor, deposit_payout_tap_tree};
 use protocol::transaction::{CustomPayoutTxBuilder, TransactionExt as _};
 use testenv::TestEnv;
 use tokio::runtime::Runtime;
 use wallet::bmp_wallet::{BMPWallet, WalletApi as _};
-use wallet::protocol_wallet_api::MemWallet;
+use wallet::protocol_wallet_api::{MemWallet, ProtocolWalletApi};
 
 #[test]
 fn test_initial_tx_creation() -> anyhow::Result<()> {
@@ -355,4 +356,35 @@ fn test_q_tik() -> anyhow::Result<()> {
     dbg!(txid);
     env.mine_block()?;
     Ok(())
+}
+
+/// The bridge the protocol needs at trade closure: import the aggregated payout secret
+/// together with `deposit_payout_tap_tree(..)` and the wallet ends up watching/signing exactly
+/// the deposit payout output's script pubkey.
+#[test]
+fn imported_payout_key_matches_deposit_payout_descriptor() {
+    let agg_secret = Scalar::from_slice(&[0x42; 32]).unwrap();
+    let internal_key: XOnlyPublicKey =
+        XOnlyPublicKey::from_slice(&agg_secret.base_point_mul().serialize_xonly()).unwrap();
+    let buyer_pub_key = &"0000000000000000000000000000000000000000000000000000000000000002"
+        .parse()
+        .unwrap();
+    let seller_pub_key = &"0000000000000000000000000000000000000000000000000000000000000003"
+        .parse()
+        .unwrap();
+
+    let dir = std::env::temp_dir().join(format!("bmp-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut w = BMPWallet::<Connection>::new(&dir, "", Network::Regtest).unwrap();
+    let trade_wallet: &mut dyn ProtocolWalletApi = &mut w;
+    trade_wallet
+        .import_private_key(
+            agg_secret,
+            Some(deposit_payout_tap_tree(buyer_pub_key, seller_pub_key).unwrap()),
+        )
+        .unwrap();
+
+    let desc = deposit_payout_descriptor(&internal_key, buyer_pub_key, seller_pub_key).unwrap();
+    assert_eq!(w.imported_keys()[0].script_pubkey(), desc.script_pubkey());
+    std::fs::remove_dir_all(&dir).unwrap();
 }

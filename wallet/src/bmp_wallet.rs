@@ -1,6 +1,5 @@
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
-use std::str::FromStr as _;
 use std::{fs, vec};
 
 use base64::Engine as _;
@@ -14,6 +13,7 @@ use bdk_wallet::bitcoin::{
 };
 use bdk_wallet::chain::Merge as _;
 use bdk_wallet::keys::bip39::Mnemonic;
+use bdk_wallet::miniscript::descriptor::{TapTree, Tr};
 use bdk_wallet::miniscript::psbt::PsbtExt as _;
 use bdk_wallet::rusqlite::{self, Connection, named_params};
 use bdk_wallet::signer::{InputSigner as _, SignerContext, SignerError, SignerWrapper};
@@ -22,7 +22,6 @@ use bdk_wallet::{
     AddressInfo, Balance, ChangeSet, KeychainKind, PersistedWallet, SignOptions, TxBuilder, Utxo,
     Wallet, WalletPersister, WeightedUtxo,
 };
-use hex::ToHex as _;
 use rand::RngCore as _;
 use secp::Scalar;
 
@@ -33,6 +32,66 @@ use crate::protocol_wallet_api::{
     sign_selected_inputs_with,
 };
 use crate::utils::{derive_key_from_password, get_salt};
+
+/// An external (non-HD) private key imported into the wallet, together with the Taproot output
+/// template it controls: `tr(P, tap_tree)` where `P` is the (untweaked) internal key derived from
+/// `secret`. A missing tap tree means a key-path-only output (`tr(P)`, as in BIP86).
+///
+/// The full descriptor is kept (rather than just the merkle root) because BDK wallets are
+/// descriptor-driven: it is what lets the per-key sub-wallet in [`get_imported_wallets`] watch
+/// the right script pubkey, and what [`BMPWallet::imported_utxos`] and [`WalletApi::sign`] use
+/// to recognise and tweak-sign the output.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImportedKey {
+    secret: Scalar,
+    descriptor: Tr<XOnlyPublicKey>,
+}
+
+impl ImportedKey {
+    pub fn new(secret: Scalar, tap_tree: Option<TapTree<XOnlyPublicKey>>) -> anyhow::Result<Self> {
+        let descriptor = Tr::new(Self::internal_key_of(&secret), tap_tree)?;
+        Ok(Self { secret, descriptor })
+    }
+
+    /// Rebuild from the persisted `tr(..)` descriptor string; checks that it belongs to `secret`.
+    fn from_descriptor_str(secret: Scalar, descriptor: &str) -> anyhow::Result<Self> {
+        let descriptor: Tr<XOnlyPublicKey> = descriptor.parse()?;
+        anyhow::ensure!(
+            *descriptor.internal_key() == Self::internal_key_of(&secret),
+            "imported key descriptor does not match its secret key"
+        );
+        Ok(Self { secret, descriptor })
+    }
+
+    fn internal_key_of(secret: &Scalar) -> XOnlyPublicKey {
+        XOnlyPublicKey::from_slice(&secret.base_point_mul().serialize_xonly())
+            .expect("Should be valid xonly pubkey")
+    }
+
+    pub const fn secret(&self) -> Scalar {
+        self.secret
+    }
+
+    pub fn internal_key(&self) -> XOnlyPublicKey {
+        *self.descriptor.internal_key()
+    }
+
+    pub fn tap_tree(&self) -> Option<&TapTree<XOnlyPublicKey>> {
+        self.descriptor.tap_tree().as_ref()
+    }
+
+    pub const fn descriptor(&self) -> &Tr<XOnlyPublicKey> {
+        &self.descriptor
+    }
+
+    pub fn merkle_root(&self) -> Option<TapNodeHash> {
+        self.descriptor.spend_info().merkle_root()
+    }
+
+    pub fn script_pubkey(&self) -> ScriptBuf {
+        self.descriptor.script_pubkey()
+    }
+}
 
 pub trait BMPWalletPersister: WalletPersister {
     type DB;
@@ -54,12 +113,12 @@ pub trait BMPWalletPersister: WalletPersister {
     fn load_imported_keys(
         db: &mut Self::DB,
         keys_table_name: &str,
-    ) -> anyhow::Result<Vec<(Scalar, Option<TapNodeHash>)>>;
+    ) -> anyhow::Result<Vec<ImportedKey>>;
 
     fn persist_imported_keys(
         db: &mut Self::DB,
         keys_table_name: &str,
-        keys: &[(Scalar, Option<TapNodeHash>)],
+        keys: &[ImportedKey],
     ) -> anyhow::Result<()>;
 
     fn get_seed_phrase(db: &Self::DB, seeds_table_name: &str) -> anyhow::Result<String>;
@@ -93,7 +152,7 @@ impl BMPWalletPersister for Connection {
         let create_imported_keys_table = format!(
             "CREATE TABLE {} ( \
                     key TEXT PRIMARY KEY NOT NULL,
-                    merkle_root TEXT
+                    descriptor TEXT NOT NULL
                 ) STRICT",
             imported_keys_table.unwrap(),
         );
@@ -137,32 +196,23 @@ impl BMPWalletPersister for Connection {
     fn load_imported_keys(
         db: &mut Self::DB,
         keys_table_name: &str,
-    ) -> anyhow::Result<Vec<(Scalar, Option<TapNodeHash>)>> {
-        let mut imported_keys: Vec<(Scalar, Option<TapNodeHash>)> = vec![];
+    ) -> anyhow::Result<Vec<ImportedKey>> {
+        let mut imported_keys = vec![];
 
         let mut statement =
-            db.prepare(&format!("SELECT key, merkle_root FROM {keys_table_name}"))?;
+            db.prepare(&format!("SELECT key, descriptor FROM {keys_table_name}"))?;
 
         let row_iter = statement.query_map([], |row| {
             Ok((
                 row.get::<_, String>("key")?,
-                row.get::<_, Option<String>>("merkle_root")?,
+                row.get::<_, String>("descriptor")?,
             ))
         })?;
 
         for row in row_iter {
-            let (key_str, merkle_opt) = row?;
-            let secret = Scalar::from_hex(&key_str)?;
-
-            match merkle_opt {
-                Some(ref s) if !s.is_empty() => {
-                    let tph = TapNodeHash::from_str(s)?;
-                    imported_keys.push((secret, Some(tph)));
-                }
-                _ => {
-                    imported_keys.push((secret, None));
-                }
-            }
+            let (key_hex, descriptor) = row?;
+            let secret = Scalar::from_hex(&key_hex)?;
+            imported_keys.push(ImportedKey::from_descriptor_str(secret, &descriptor)?);
         }
 
         Ok(imported_keys)
@@ -171,23 +221,19 @@ impl BMPWalletPersister for Connection {
     fn persist_imported_keys(
         db: &mut Self::DB,
         keys_table_name: &str,
-        keys: &[(Scalar, Option<TapNodeHash>)],
+        keys: &[ImportedKey],
     ) -> anyhow::Result<()> {
         let db_trx = db.transaction()?;
         {
             let mut statement = db_trx.prepare_cached(&format!(
-                "INSERT OR IGNORE INTO {keys_table_name} (key, merkle_root) VALUES (:key, :m_root)"
+                "INSERT OR IGNORE INTO {keys_table_name} (key, descriptor) \
+                 VALUES (:key, :descriptor)"
             ))?;
 
             for key in keys {
-                let root = if let Some(h) = key.1 {
-                    h.encode_hex()
-                } else {
-                    String::new()
-                };
                 statement.execute(named_params! {
-                    ":key": key.0.serialize().to_lower_hex_string(),
-                    ":m_root": root,
+                    ":key": key.secret().serialize().to_lower_hex_string(),
+                    ":descriptor": key.descriptor().to_string(),
                 })?;
             }
         }
@@ -211,7 +257,7 @@ const STOP_GAP: usize = 50;
 
 pub struct BMPWallet<P: BMPWalletPersister> {
     wallet: PersistedWallet<P>,
-    imported_keys: Vec<(Scalar, Option<TapNodeHash>)>,
+    imported_keys: Vec<ImportedKey>,
     imported_balance: Balance,
     signers_loaded: bool,
     db: P,
@@ -259,30 +305,37 @@ impl BMPWallet<Connection> {
         Ok(addr)
     }
 
-    // Import an external private from the HD wallet
-    // After importing a rescan should be triggered
-    pub fn import_private_key(&mut self, pk: Scalar, merkle_root: Option<TapNodeHash>) {
-        self.imported_keys.push((pk, merkle_root));
+    /// Import an external private key (i.e. one not derived from the HD wallet) controlling a
+    /// `tr(P, tap_tree)` output, `P` being the untweaked internal key of `pk`. `None` means a
+    /// key-path-only `tr(P)` output. After importing, a rescan should be triggered.
+    pub fn import_private_key(
+        &mut self,
+        pk: Scalar,
+        tap_tree: Option<TapTree<XOnlyPublicKey>>,
+    ) -> Result<(), WalletErrorKind> {
+        self.imported_keys.push(ImportedKey::new(pk, tap_tree)?);
+        Ok(())
+    }
+
+    /// Test-only introspection of the imported keys; enable the `test-utils` feature to use it
+    /// from tests in downstream crates.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn imported_keys(&self) -> &[ImportedKey] {
+        &self.imported_keys
     }
 
     fn imported_utxos(&self) -> Vec<WeightedUtxo> {
-        let secp: &bdk_wallet::bitcoin::key::Secp256k1<bdk_wallet::bitcoin::secp256k1::All> =
-            self.secp_ctx();
         self.tx_graph()
             .floating_txouts()
             .map(|utxo| {
                 let output_script_pubkey = &utxo.1.script_pubkey;
 
-                let tap_internal_key = self
+                let (tap_internal_key, tap_merkle_root) = self
                     .imported_keys
                     .iter()
-                    .map(|scalar| {
-                        let pbk = scalar.0.base_point_mul().serialize_xonly();
-                        XOnlyPublicKey::from_slice(&pbk).expect("Should be valid xonly pubkey")
-                    })
-                    .find(|pubkey| {
-                        let script = ScriptBuf::new_p2tr(secp, *pubkey, None);
-                        script == *output_script_pubkey
+                    .find(|key| key.script_pubkey() == *output_script_pubkey)
+                    .map_or((None, None), |key| {
+                        (Some(key.internal_key()), key.merkle_root())
                     });
 
                 WeightedUtxo {
@@ -292,6 +345,7 @@ impl BMPWallet<Connection> {
                         psbt_input: Box::new(psbt::Input {
                             witness_utxo: Some(utxo.1.clone()),
                             tap_internal_key,
+                            tap_merkle_root,
                             ..Default::default()
                         }),
                     },
@@ -349,10 +403,12 @@ impl ProtocolWalletApi for BMPWallet<Connection> {
         })
     }
 
-    // Import an external private from the HD wallet
-    // After importing a rescan should be triggered
-    fn import_private_key(&mut self, pk: Scalar, merkle_root: Option<TapNodeHash>) {
-        self.import_private_key(pk, merkle_root);
+    fn import_private_key(
+        &mut self,
+        pk: Scalar,
+        tap_tree: Option<TapTree<XOnlyPublicKey>>,
+    ) -> Result<(), WalletErrorKind> {
+        self.import_private_key(pk, tap_tree)
     }
 }
 
@@ -393,30 +449,37 @@ pub trait WalletApi {
 }
 
 pub fn get_imported_wallets(
-    imported_keys: &Vec<(Scalar, Option<TapNodeHash>)>,
+    imported_keys: &[ImportedKey],
     db: &Connection,
     network: Network,
     db_name: &str,
 ) -> anyhow::Result<Vec<(PersistedWallet<Connection>, Connection)>> {
     let mut res = vec![];
     for key in imported_keys {
-        let pubk = key.0.base_point_mul();
-        let pubk = pubk.serialize_xonly().to_lower_hex_string();
+        let pubk = key.internal_key();
+        // One sub-wallet DB per output template: the same internal key may back a key-path-only
+        // output and a `tr(P, tree)` output, which have different script pubkeys.
+        let db_file = match key.merkle_root() {
+            None => format!("bmp_{pubk}.db3"),
+            Some(root) => format!("bmp_{pubk}_{root}.db3"),
+        };
         let path_str = db
             .path()
             .expect("DB path should not be empty")
             .replace(db_name, "");
-        let db_path = Path::new(&path_str).join(format!("bmp_{pubk}.db3"));
+        let db_path = Path::new(&path_str).join(db_file);
+        let descriptor = key.descriptor().to_string();
 
         let mut db = Connection::open(db_path)?;
         let imported_wallet_opt = Wallet::load()
+            .descriptor(KeychainKind::External, Some(descriptor.clone()))
             .check_network(network)
             .extract_keys()
             .load_wallet(&mut db)?;
 
-        let imported_wallet = if let Some(wallet) = imported_wallet_opt { wallet } else {
-            let descriptor = format!("tr({pubk})");
-
+        let imported_wallet = if let Some(wallet) = imported_wallet_opt {
+            wallet
+        } else {
             Wallet::create_single(descriptor)
                 .network(network)
                 .create_wallet(&mut db)?
@@ -548,25 +611,18 @@ impl WalletApi for BMPWallet<Connection> {
         //// @TODO performance: cache the public keys derivation
         let secp = self.secp_ctx();
         let is_mine = |input_script: &ScriptBuf| {
-            for key in &self.imported_keys {
-                let xonly_pubkey = key.0.base_point_mul().serialize_xonly();
-                let xonly_pubkey = XOnlyPublicKey::from_slice(&xonly_pubkey)
-                    .expect("Should be valid xonly pubkey");
-                let script = ScriptBuf::new_p2tr(secp, xonly_pubkey, key.1);
-
-                if script == *input_script {
-                    return Some(*key);
-                }
-            }
-            None
+            self.imported_keys
+                .iter()
+                .find(|key| key.script_pubkey() == *input_script)
         };
 
         for (input_index, input_details) in psbt.inputs.clone().iter().enumerate() {
             let txout = input_details.witness_utxo.as_ref().unwrap();
 
             if let Some(signing_key) = is_mine(&txout.script_pubkey) {
-                let signer = PrivateKey::from_slice(&signing_key.0.serialize(), self.network())
-                    .map_err(|_e| SignerError::External("Invalid signing key".to_owned()))?;
+                let signer =
+                    PrivateKey::from_slice(&signing_key.secret().serialize(), self.network())
+                        .map_err(|_e| SignerError::External("Invalid signing key".to_owned()))?;
 
                 let sw = SignerWrapper::new(
                     signer,
@@ -728,12 +784,14 @@ mod tests {
     use bdk_kyoto::FeeRate;
     use bdk_kyoto::bip157::{ScriptBuf, tokio};
     use bdk_wallet::bitcoin::hashes::Hash as _;
-    use bdk_wallet::bitcoin::key::Secp256k1;
+    use bdk_wallet::bitcoin::key::{Secp256k1, TapTweak as _};
+    use bdk_wallet::bitcoin::secp256k1::Message;
+    use bdk_wallet::bitcoin::sighash::{Prevouts, SighashCache};
     use bdk_wallet::bitcoin::{
-        Address, AddressType, Amount, BlockHash, Network, OutPoint, TapNodeHash, TxOut, Weight,
-        psbt,
+        Address, AddressType, Amount, BlockHash, Network, OutPoint, TxOut, Weight, psbt, taproot,
     };
     use bdk_wallet::chain::{self, BlockId};
+    use bdk_wallet::miniscript::Descriptor;
     use bdk_wallet::test_utils::{ReceiveTo, receive_output_to_address};
     use bdk_wallet::{AddressInfo, KeychainKind, SignOptions};
     use bmp_tracing::tracing;
@@ -741,6 +799,7 @@ mod tests {
     use secp::Scalar;
     use tempfile::{TempDir, tempdir};
 
+    use super::{TapTree, XOnlyPublicKey};
     use crate::bmp_wallet::{BMPWallet, STOP_GAP, WalletApi as _};
     use crate::test_utils::{MockedBDKElectrum, derive_public_key, load_imported_wallet};
 
@@ -752,6 +811,17 @@ mod tests {
         let mut seed: [u8; 32] = [0u8; 32];
         rand::rng().fill_bytes(&mut seed);
         Scalar::from_slice(&seed).unwrap()
+    }
+
+    /// Single-leaf tap tree `and_v(v:pk(a),pk(b))`, the shape of the protocol's deposit payouts.
+    fn sample_tap_tree(a: &XOnlyPublicKey, b: &XOnlyPublicKey) -> TapTree<XOnlyPublicKey> {
+        let Descriptor::Tr(tr) = format!("tr({a},and_v(v:pk({a}),pk({b})))")
+            .parse::<Descriptor<XOnlyPublicKey>>()
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        tr.tap_tree().clone().unwrap()
     }
 
     #[test]
@@ -837,8 +907,8 @@ mod tests {
         let pk1 = new_private_key();
         let pk2 = new_private_key();
 
-        bmp_wallet.import_private_key(pk1, None);
-        bmp_wallet.import_private_key(pk2, None);
+        bmp_wallet.import_private_key(pk1, None)?;
+        bmp_wallet.import_private_key(pk2, None)?;
 
         assert_eq!(bmp_wallet.imported_keys.len(), 2);
 
@@ -850,18 +920,24 @@ mod tests {
     }
 
     #[test]
-    fn test_imported_keys_with_merkle_root() -> anyhow::Result<()> {
+    fn test_imported_keys_with_tap_tree() -> anyhow::Result<()> {
         let dir = get_dir();
         let mut bmp_wallet = BMPWallet::new(dir.path(), "", Network::Regtest)?;
         let pk = new_private_key();
 
-        // Create a sample merkle root (32 bytes hex)
-        let merkle_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let merkle = TapNodeHash::from_str(merkle_hex)?;
+        // A tap tree like the protocol's deposit payout: and_v(v:pk(A),pk(B))
+        let (a, b) = (
+            derive_public_key(&new_private_key()),
+            derive_public_key(&new_private_key()),
+        );
+        let tap_tree = sample_tap_tree(&a, &b);
 
-        bmp_wallet.import_private_key(pk, Some(merkle));
+        bmp_wallet.import_private_key(pk, Some(tap_tree.clone()))?;
 
         assert_eq!(bmp_wallet.imported_keys.len(), 1);
+        let merkle_root = bmp_wallet.imported_keys[0]
+            .merkle_root()
+            .expect("merkle root should be present");
 
         // Persist
         bmp_wallet.persist()?;
@@ -869,12 +945,12 @@ mod tests {
 
         assert_eq!(loaded_wallet.imported_keys.len(), 1);
 
-        let (loaded_pk, loaded_merkle_opt) = &loaded_wallet.imported_keys[0];
-        assert_eq!(loaded_pk, &pk);
-        let loaded_merkle = loaded_merkle_opt
-            .as_ref()
-            .expect("merkle root should be present");
-        assert_eq!(loaded_merkle.to_string(), merkle_hex);
+        let loaded = &loaded_wallet.imported_keys[0];
+        assert_eq!(loaded.secret(), pk);
+        assert_eq!(loaded.internal_key(), derive_public_key(&pk));
+        assert_eq!(loaded.tap_tree(), Some(&tap_tree));
+        assert_eq!(loaded.merkle_root(), Some(merkle_root));
+        assert_eq!(loaded_wallet.imported_keys, bmp_wallet.imported_keys);
 
         Ok(())
     }
@@ -905,8 +981,8 @@ mod tests {
         let dir = get_dir();
         let mut bmp_wallet = BMPWallet::new(dir.path(), "", Network::Regtest)?;
 
-        bmp_wallet.import_private_key(pk1, None);
-        bmp_wallet.import_private_key(pk2, None);
+        bmp_wallet.import_private_key(pk1, None)?;
+        bmp_wallet.import_private_key(pk2, None)?;
 
         assert_eq!(bmp_wallet.imported_keys.len(), 2);
 
@@ -965,7 +1041,7 @@ mod tests {
 
         let keys_to_import = [new_private_key(), new_private_key()];
         for k in &keys_to_import {
-            bmp_wallet.import_private_key(*k, None);
+            bmp_wallet.import_private_key(*k, None)?;
         }
 
         tracing::info!("Wallet balance before syncing {}", bmp_wallet.balance());
@@ -1028,43 +1104,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sign_with_imported_key_merkle_root() -> anyhow::Result<()> {
+    async fn sign_with_imported_key_tap_tree() -> anyhow::Result<()> {
         let dir = get_dir();
         let mut bmp_wallet = BMPWallet::new(dir.path(), "", Network::Regtest)?;
 
         let pk = new_private_key();
+        let (a, b) = (
+            derive_public_key(&new_private_key()),
+            derive_public_key(&new_private_key()),
+        );
+        let tap_tree = sample_tap_tree(&a, &b);
 
-        // Example merkle root hex (32 bytes)
-        let merkle_hex = "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd";
-        let merkle = TapNodeHash::from_str(merkle_hex)?;
+        // Import private key with tap tree
+        bmp_wallet.import_private_key(pk, Some(tap_tree))?;
+        let imported = bmp_wallet.imported_keys[0].clone();
+        let merkle_root = imported
+            .merkle_root()
+            .expect("merkle root should be present");
 
-        // Import private key with merkle root
-        bmp_wallet.import_private_key(pk, Some(merkle));
-
-        // Build a tx consuming a foreign utxo that pays to tr(pubkey, merkle_root)
+        // The output the key controls is tr(P, tap_tree), *not* tr(P)
         let secp = Secp256k1::new();
         let xonly = derive_public_key(&pk);
+        assert_eq!(
+            imported.script_pubkey(),
+            ScriptBuf::new_p2tr(&secp, xonly, Some(merkle_root))
+        );
 
+        // Put a utxo paying to tr(P, tap_tree) into the wallet's graph, the way `sync_all` does,
+        // and let the wallet's own `build_tx` path (imported_utxos) prepare the PSBT input.
         let outpoint = OutPoint::from_str(
             "0000000000000000000000000000000000000000000000000000000000000001:0",
         )?;
-
         let txout = TxOut {
             value: Amount::ONE_BTC,
-            script_pubkey: ScriptBuf::new_p2tr(&secp, xonly, Some(merkle)),
+            script_pubkey: imported.script_pubkey(),
         };
-
-        let mut psbt_input = psbt::Input {
-            witness_utxo: Some(txout.clone()),
-            tap_internal_key: Some(xonly),
-            ..Default::default()
-        };
-        psbt_input.tap_merkle_root = Some(merkle);
+        bmp_wallet.insert_txout(outpoint, txout);
 
         let mut tx_builder = bmp_wallet.build_tx();
-        tx_builder
-            .add_foreign_utxo(outpoint, psbt_input, Weight::from_wu(66))
-            .unwrap();
 
         // Add a recipient so transaction can be built
         let to_address = "tb1pyfv094rr0vk28lf8v9yx3veaacdzg26ztqk4ga84zucqqhafnn5q9my9rz";
@@ -1072,6 +1149,10 @@ mod tests {
         tx_builder.add_recipient(to_address, Amount::from_sat(100_000));
 
         let mut res_psbt = tx_builder.finish()?;
+
+        assert_eq!(res_psbt.inputs.len(), 1);
+        assert_eq!(res_psbt.inputs[0].tap_internal_key, Some(xonly));
+        assert_eq!(res_psbt.inputs[0].tap_merkle_root, Some(merkle_root));
 
         bmp_wallet.sign(&mut res_psbt, SignOptions::default())?;
 
@@ -1081,6 +1162,29 @@ mod tests {
                 .iter()
                 .all(|i| i.final_script_witness.is_some())
         );
+
+        // The key-path signature must verify against the *tweaked* output key
+        let witness = res_psbt.inputs[0].final_script_witness.as_ref().unwrap();
+        assert_eq!(
+            witness.len(),
+            1,
+            "key-path spend has a single witness element"
+        );
+        let sig = taproot::Signature::from_slice(&witness[0])?;
+        let output_key = xonly
+            .tap_tweak(&secp, Some(merkle_root))
+            .0
+            .to_x_only_public_key();
+        let sighash = {
+            let prevouts = [res_psbt.inputs[0].witness_utxo.clone().unwrap()];
+            let mut cache = SighashCache::new(&res_psbt.unsigned_tx);
+            cache.taproot_key_spend_signature_hash(
+                0,
+                &Prevouts::All(&prevouts),
+                sig.sighash_type,
+            )?
+        };
+        secp.verify_schnorr(&sig.signature, &Message::from(sighash), &output_key)?;
 
         Ok(())
     }
@@ -1101,8 +1205,8 @@ mod tests {
             186, 216, 94, 123, 55, 23, 125, 232, 214, 160, 33, 172, 124, 61,
         ];
 
-        bmp_wallet.import_private_key(Scalar::from_slice(&pk1).unwrap(), None);
-        bmp_wallet.import_private_key(Scalar::from_slice(&pk2).unwrap(), None);
+        bmp_wallet.import_private_key(Scalar::from_slice(&pk1).unwrap(), None)?;
+        bmp_wallet.import_private_key(Scalar::from_slice(&pk2).unwrap(), None)?;
 
         bmp_wallet.sync_all(&client).await?;
 
@@ -1171,8 +1275,8 @@ mod tests {
         let dir = get_dir();
         let mut bmp_wallet = BMPWallet::new(dir.path(), "", Network::Regtest)?;
 
-        bmp_wallet.import_private_key(pk1, None);
-        bmp_wallet.import_private_key(pk2, None);
+        bmp_wallet.import_private_key(pk1, None)?;
+        bmp_wallet.import_private_key(pk2, None)?;
 
         assert_eq!(bmp_wallet.imported_keys.len(), 2);
 
