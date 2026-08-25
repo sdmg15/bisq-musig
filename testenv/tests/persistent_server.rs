@@ -52,7 +52,7 @@ impl ServerHandle {
 
         // Collect lines until the server signals readiness and we have the fields we need.
         let mut info = HashMap::new();
-        let deadline = Instant::now() + Duration::from_secs(120);
+        let deadline = Instant::now() + Duration::from_mins(2);
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             assert!(
