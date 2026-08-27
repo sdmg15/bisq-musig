@@ -22,7 +22,7 @@ async fn init_test() -> anyhow::Result<()> {
     let mut env = TestEnv::new()?;
     let chain = env.new_testchain()?;
 
-    let mut wallet = BMPWallet::new(env.new_temp_path(), "", Network::Regtest)?;
+    let mut wallet = BMPWallet::new(env.new_temp_path().into(), "", Network::Regtest)?;
     let receive_amount = Amount::from_sat(100_000);
 
     let receiving_addr = wallet.next_unused_address(KeychainKind::External);
@@ -45,7 +45,7 @@ async fn test_sync_with_imported_keys() -> anyhow::Result<()> {
 
     let receive_amount = Amount::from_sat(100_000);
 
-    let mut wallet = BMPWallet::new(env.new_temp_path(), "", Network::Regtest)?;
+    let mut wallet = BMPWallet::new(env.new_temp_path().into(), "", Network::Regtest)?;
     wallet.import_private_key(prv_key, None)?;
 
     let receiving_addr = wallet.next_unused_address(KeychainKind::External);
@@ -73,7 +73,8 @@ async fn test_broadcast_transaction() -> anyhow::Result<()> {
     // directories. `.to_path_buf()` ends the `&mut env` borrow immediately so the rest of
     // the test can keep mutating `env`.
     let dir = env.new_temp_path().to_path_buf();
-    let mut wallet = BMPWallet::new(&dir, "", Network::Regtest)?;
+    let dir = dir.as_path();
+    let mut wallet = BMPWallet::new(dir.into(), "", Network::Regtest)?;
     wallet.import_private_key(prv_key, None)?;
 
     let receive_amount = Amount::from_sat(100_000);
@@ -107,7 +108,7 @@ async fn test_broadcast_transaction() -> anyhow::Result<()> {
     assert_eq!(wallet.balance(), new_balance);
 
     // Reload the wallet by encrypting it to make sure the state changes are persisted
-    let enc_wallet = BMPWallet::load_wallet(&dir, Network::Regtest, "")?;
+    let enc_wallet = BMPWallet::load_wallet(dir.into(), Network::Regtest, "")?;
     assert_eq!(enc_wallet.balance(), new_balance);
 
     Ok(())
@@ -123,7 +124,8 @@ async fn test_broadcast_transaction_two() -> anyhow::Result<()> {
 
     // See note in `test_broadcast_transaction` re: binding the temp dir once.
     let dir = env.new_temp_path().to_path_buf();
-    let mut wallet = BMPWallet::new(&dir, "", Network::Regtest)?;
+    let dir = dir.as_path();
+    let mut wallet = BMPWallet::new(dir.into(), "", Network::Regtest)?;
     wallet.import_private_key(prv_key, None)?;
 
     let receive_amount = Amount::from_sat(100_000);
@@ -155,7 +157,7 @@ async fn test_broadcast_transaction_two() -> anyhow::Result<()> {
     assert_eq!(wallet.balance(), new_balance);
 
     // Reload the wallet by encrypting it to make sure the state changes are persisted
-    let enc_wallet = BMPWallet::load_wallet(&dir, Network::Regtest, "")?;
+    let enc_wallet = BMPWallet::load_wallet(dir.into(), Network::Regtest, "")?;
     assert_eq!(enc_wallet.balance(), new_balance);
 
     Ok(())
@@ -172,7 +174,8 @@ async fn test_broadcast_transaction_three() -> anyhow::Result<()> {
 
     // See note in `test_broadcast_transaction` re: binding the temp dir once.
     let dir = env.new_temp_path().to_path_buf();
-    let mut wallet = BMPWallet::new(&dir, "", Network::Regtest)?;
+    let dir = dir.as_path();
+    let mut wallet = BMPWallet::new(dir.into(), "", Network::Regtest)?;
     wallet.import_private_key(prv_key, None)?;
 
     let main_wallet_addr = wallet.next_unused_address(KeychainKind::External);
@@ -209,7 +212,7 @@ async fn test_broadcast_transaction_three() -> anyhow::Result<()> {
     assert_eq!(wallet.balance(), new_balance);
 
     // Reload the wallet by encrypting it to make sure the state changes are persisted
-    let mut enc_wallet = BMPWallet::load_wallet(&dir, Network::Regtest, "")?;
+    let mut enc_wallet = BMPWallet::load_wallet(dir.into(), Network::Regtest, "")?;
 
     env.fund_address(&main_wallet_addr, Amount::from_sat(10_000))?;
     env.mine_block()?;
@@ -223,7 +226,7 @@ async fn test_broadcast_transaction_three() -> anyhow::Result<()> {
 async fn test_cbf_main_wallet() -> anyhow::Result<()> {
     let mut env = TestEnv::new()?;
     env.mine_blocks(2)?;
-    let mut wallet = BMPWallet::new(env.new_temp_path(), "", Network::Regtest)?;
+    let mut wallet = BMPWallet::new(env.new_temp_path().into(), "", Network::Regtest)?;
     let addr = wallet.next_unused_address(KeychainKind::External);
     env.fund_address(&addr, Amount::from_sat(100_000))?;
 
@@ -244,7 +247,7 @@ async fn test_cbf_imported() -> anyhow::Result<()> {
     let mut env = TestEnv::new()?;
     env.mine_block()?;
 
-    let mut wallet = BMPWallet::new(env.new_temp_path(), "", Network::Regtest)?;
+    let mut wallet = BMPWallet::new(env.new_temp_path().into(), "", Network::Regtest)?;
 
     let prv_keys = [new_private_key(), new_private_key(), new_private_key()];
     for e in &prv_keys {
@@ -272,7 +275,7 @@ async fn test_cbf_imported_and_main() -> anyhow::Result<()> {
 
     env.mine_block()?;
 
-    let mut wallet = BMPWallet::new(env.new_temp_path(), "", Network::Regtest)?;
+    let mut wallet = BMPWallet::new(env.new_temp_path().into(), "", Network::Regtest)?;
     let addr = wallet.next_unused_address(KeychainKind::External);
     env.fund_address(&addr, Amount::from_sat(100_000))?;
 
@@ -306,7 +309,8 @@ async fn test_cbf_persistence() -> anyhow::Result<()> {
 
     // See note in `test_broadcast_transaction` re: binding the temp dir once.
     let dir = env.new_temp_path().to_path_buf();
-    let mut wallet = BMPWallet::new(&dir, "", Network::Regtest)?;
+    let dir = dir.as_path();
+    let mut wallet = BMPWallet::new(dir.into(), "", Network::Regtest)?;
     let addr = wallet.next_unused_address(KeychainKind::External);
     env.fund_address(&addr, Amount::from_sat(230_000))?;
 
@@ -320,7 +324,7 @@ async fn test_cbf_persistence() -> anyhow::Result<()> {
     assert_eq!(wallet.balance(), Amount::from_sat(230_000));
 
     // Reload the wallet from persisted state
-    let mut loaded_wallet = BMPWallet::load_wallet(&dir, Network::Regtest, "")?;
+    let mut loaded_wallet = BMPWallet::load_wallet(dir.into(), Network::Regtest, "")?;
     assert_eq!(loaded_wallet.balance(), Amount::from_sat(230_000));
 
     env.fund_address(&addr, Amount::from_sat(70_000))?;
@@ -358,7 +362,7 @@ async fn test_drain_wallet_with_main_balance() -> anyhow::Result<()> {
 
     env.mine_block()?;
 
-    let mut wallet = BMPWallet::new(env.new_temp_path(), "", Network::Regtest)?;
+    let mut wallet = BMPWallet::new(env.new_temp_path().into(), "", Network::Regtest)?;
     let addr = wallet.next_unused_address(KeychainKind::External);
 
     let amount_to_send_main_wallet = Amount::from_sat(100_000);
@@ -409,7 +413,7 @@ async fn test_drain_wallet_no_balance() {
 
     env.mine_block().unwrap();
 
-    let mut wallet = BMPWallet::new(env.new_temp_path(), "", Network::Regtest).unwrap();
+    let mut wallet = BMPWallet::new(env.new_temp_path().into(), "", Network::Regtest).unwrap();
     let addr = wallet.next_unused_address(KeychainKind::External);
 
     let amount_to_send_main_wallet = Amount::from_sat(100_000);

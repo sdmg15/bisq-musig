@@ -29,8 +29,8 @@ use sha2::Sha256;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use typed_arena::Arena;
-use wallet::bmp_wallet::BMPWalletPersister;
 use wallet::chain_data_source::ChainDataSource;
+use wallet::persisted::BMPWalletPersister;
 
 /// Bitcoin regtest environment manager
 pub struct TestEnv {

@@ -16,8 +16,8 @@ use bdk_wallet::test_utils::{insert_checkpoint, receive_output_in_latest_block};
 use bdk_wallet::{KeychainKind, LocalOutput, PersistedWallet, Utxo, Wallet, WeightedUtxo};
 use secp::Scalar;
 
-use crate::bmp_wallet::BMPWalletPersister;
 use crate::chain_data_source::ChainDataSource;
+use crate::persisted::BMPWalletPersister;
 
 pub struct MockedBDKElectrum;
 

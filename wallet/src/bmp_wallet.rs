@@ -1,12 +1,8 @@
 use std::ops::{Deref, DerefMut};
-use std::path::Path;
-use std::{fs, vec};
+use std::vec;
 
-use base64::Engine as _;
-use base64::engine::general_purpose;
 use bdk_electrum::bdk_core::bitcoin::{Address, FeeRate, OutPoint};
 use bdk_wallet::bitcoin::bip32::Xpriv;
-use bdk_wallet::bitcoin::hex::DisplayHex as _;
 use bdk_wallet::bitcoin::{
     Amount, Network, PrivateKey, Psbt, ScriptBuf, Sequence, TapNodeHash, Weight, XOnlyPublicKey,
     psbt,
@@ -15,23 +11,24 @@ use bdk_wallet::chain::Merge as _;
 use bdk_wallet::keys::bip39::Mnemonic;
 use bdk_wallet::miniscript::descriptor::{TapTree, Tr};
 use bdk_wallet::miniscript::psbt::PsbtExt as _;
-use bdk_wallet::rusqlite::{self, Connection, named_params};
+use bdk_wallet::rusqlite::Connection;
 use bdk_wallet::signer::{InputSigner as _, SignerContext, SignerError, SignerWrapper};
 use bdk_wallet::template::{Bip86, DescriptorTemplate as _};
 use bdk_wallet::{
-    AddressInfo, Balance, ChangeSet, KeychainKind, PersistedWallet, SignOptions, TxBuilder, Utxo,
-    Wallet, WalletPersister, WeightedUtxo,
+    AddressInfo, Balance, KeychainKind, PersistedWallet, SignOptions, TxBuilder, Utxo, Wallet,
+    WeightedUtxo,
 };
 use rand::RngCore as _;
 use secp::Scalar;
 
 use crate::chain_data_source::ChainDataSource;
 use crate::coin_selection::{AlwaysSpendImportedFirst, SpendImportedOnly};
+use crate::persisted::{BMPDatabase, BMPWalletPersister, DBStorage};
 use crate::protocol_wallet_api::{
     ProtocolWalletApi, WalletErrorKind, WalletExt, finish_standard_psbt, internal_key_at_index,
     sign_selected_inputs_with,
 };
-use crate::utils::{derive_key_from_password, get_salt};
+use crate::utils::derive_key_from_password;
 
 /// An external (non-HD) private key imported into the wallet, together with the Taproot output
 /// template it controls: `tr(P, tap_tree)` where `P` is the (untweaked) internal key derived from
@@ -54,7 +51,7 @@ impl ImportedKey {
     }
 
     /// Rebuild from the persisted `tr(..)` descriptor string; checks that it belongs to `secret`.
-    fn from_descriptor_str(secret: Scalar, descriptor: &str) -> anyhow::Result<Self> {
+    pub(crate) fn from_descriptor_str(secret: Scalar, descriptor: &str) -> anyhow::Result<Self> {
         let descriptor: Tr<XOnlyPublicKey> = descriptor.parse()?;
         anyhow::ensure!(
             *descriptor.internal_key() == Self::internal_key_of(&secret),
@@ -93,166 +90,6 @@ impl ImportedKey {
     }
 }
 
-pub trait BMPWalletPersister: WalletPersister {
-    type DB;
-
-    fn new(db_path: &str) -> anyhow::Result<Self::DB, <Self as WalletPersister>::Error>;
-
-    fn init(
-        db: &mut Self::DB,
-        imported_keys_table: Option<&str>,
-        seeds_table_name: Option<&str>,
-    ) -> anyhow::Result<()>;
-
-    fn persist_seed_phrase(
-        db: &mut Self::DB,
-        seeds_table_name: &str,
-        seed_phrase: &str,
-    ) -> anyhow::Result<()>;
-
-    fn load_imported_keys(
-        db: &mut Self::DB,
-        keys_table_name: &str,
-    ) -> anyhow::Result<Vec<ImportedKey>>;
-
-    fn persist_imported_keys(
-        db: &mut Self::DB,
-        keys_table_name: &str,
-        keys: &[ImportedKey],
-    ) -> anyhow::Result<()>;
-
-    fn get_seed_phrase(db: &Self::DB, seeds_table_name: &str) -> anyhow::Result<String>;
-
-    fn persist_staged_changes(
-        db: &mut Self::DB,
-        cs: &ChangeSet,
-    ) -> anyhow::Result<(), rusqlite::Error>;
-}
-
-impl BMPWalletPersister for Connection {
-    type DB = Self;
-
-    fn new(db_path: &str) -> Result<Self::DB, rusqlite::Error> {
-        let db = Self::open(db_path)?;
-        Ok(db)
-    }
-
-    fn persist_staged_changes(
-        db: &mut Self::DB,
-        cs: &ChangeSet,
-    ) -> anyhow::Result<(), rusqlite::Error> {
-        Self::persist(db, cs)
-    }
-
-    fn init(
-        db: &mut Self::DB,
-        imported_keys_table: Option<&str>,
-        seeds_table_name: Option<&str>,
-    ) -> anyhow::Result<()> {
-        let create_imported_keys_table = format!(
-            "CREATE TABLE {} ( \
-                    key TEXT PRIMARY KEY NOT NULL,
-                    descriptor TEXT NOT NULL
-                ) STRICT",
-            imported_keys_table.unwrap(),
-        );
-
-        let create_seeds_table = format!(
-            "CREATE TABLE {} ( \
-                    seed TEXT PRIMARY KEY NOT NULL
-                ) STRICT",
-            seeds_table_name.unwrap(),
-        );
-
-        let query = format!("{create_imported_keys_table}; {create_seeds_table}");
-
-        let trx = db.transaction()?;
-
-        trx.execute_batch(&query)?;
-        trx.commit()?;
-        Ok(())
-    }
-
-    fn persist_seed_phrase(
-        db: &mut Self::DB,
-        seeds_table_name: &str,
-        seed_phrase: &str,
-    ) -> anyhow::Result<()> {
-        let trx = db.transaction()?;
-        {
-            let mut stmt = trx.prepare(&format!(
-                "INSERT INTO {seeds_table_name}(seed) VALUES(:seed)"
-            ))?;
-
-            stmt.execute(named_params! {
-                ":seed": seed_phrase
-            })?;
-        }
-
-        trx.commit()?;
-        Ok(())
-    }
-
-    fn load_imported_keys(
-        db: &mut Self::DB,
-        keys_table_name: &str,
-    ) -> anyhow::Result<Vec<ImportedKey>> {
-        let mut imported_keys = vec![];
-
-        let mut statement =
-            db.prepare(&format!("SELECT key, descriptor FROM {keys_table_name}"))?;
-
-        let row_iter = statement.query_map([], |row| {
-            Ok((
-                row.get::<_, String>("key")?,
-                row.get::<_, String>("descriptor")?,
-            ))
-        })?;
-
-        for row in row_iter {
-            let (key_hex, descriptor) = row?;
-            let secret = Scalar::from_hex(&key_hex)?;
-            imported_keys.push(ImportedKey::from_descriptor_str(secret, &descriptor)?);
-        }
-
-        Ok(imported_keys)
-    }
-
-    fn persist_imported_keys(
-        db: &mut Self::DB,
-        keys_table_name: &str,
-        keys: &[ImportedKey],
-    ) -> anyhow::Result<()> {
-        let db_trx = db.transaction()?;
-        {
-            let mut statement = db_trx.prepare_cached(&format!(
-                "INSERT OR IGNORE INTO {keys_table_name} (key, descriptor) \
-                 VALUES (:key, :descriptor)"
-            ))?;
-
-            for key in keys {
-                statement.execute(named_params! {
-                    ":key": key.secret().serialize().to_lower_hex_string(),
-                    ":descriptor": key.descriptor().to_string(),
-                })?;
-            }
-        }
-
-        db_trx.commit()?;
-        Ok(())
-    }
-
-    fn get_seed_phrase(db: &Self::DB, seeds_table_name: &str) -> anyhow::Result<String> {
-        let mnemonic = db.query_row(
-            &format!("SELECT seed FROM {seeds_table_name}"),
-            (),
-            |row| row.get::<_, String>("seed"),
-        )?;
-
-        Ok(mnemonic)
-    }
-}
-
 pub(crate) const STOP_GAP: usize = 50;
 
 pub struct BMPWallet<P: BMPWalletPersister> {
@@ -260,7 +97,7 @@ pub struct BMPWallet<P: BMPWalletPersister> {
     imported_keys: Vec<ImportedKey>,
     imported_balance: Balance,
     signers_loaded: bool,
-    db: P,
+    db: BMPDatabase<P>,
     last_unused_address: Option<String>,
 }
 
@@ -367,9 +204,8 @@ impl BMPWallet<Connection> {
 
     fn load_imported_wallets(
         imported_keys: &[ImportedKey],
-        db: &Connection,
+        storage: &DBStorage,
         network: Network,
-        db_name: &str,
     ) -> anyhow::Result<Vec<(PersistedWallet<Connection>, Connection)>> {
         let mut res = vec![];
         for key in imported_keys {
@@ -380,14 +216,11 @@ impl BMPWallet<Connection> {
                 None => format!("bmp_{pubk}.db3"),
                 Some(root) => format!("bmp_{pubk}_{root}.db3"),
             };
-            let path_str = db
-                .path()
-                .expect("DB path should not be empty")
-                .replace(db_name, "");
-            let db_path = Path::new(&path_str).join(db_file);
+
+            let imported_storage = storage.sibling(&db_file);
+            let mut db = imported_storage.open(&db_file)?;
             let descriptor = key.descriptor().to_string();
 
-            let mut db = Connection::open(db_path)?;
             let imported_wallet_opt = Wallet::load()
                 .descriptor(KeychainKind::External, Some(descriptor.clone()))
                 .check_network(network)
@@ -463,11 +296,11 @@ pub trait WalletApi {
     const SEEDS_TABLE_NAME: &'static str;
     const IMPORTED_KEYS_TABLE_NAME: &'static str;
 
-    fn new(path: &Path, password: &str, network: Network) -> anyhow::Result<Self>
+    fn new(storage: DBStorage, password: &str, network: Network) -> anyhow::Result<Self>
     where
         Self: Sized;
 
-    fn load_wallet(path: &Path, network: Network, password: &str) -> anyhow::Result<Self>
+    fn load_wallet(storage: DBStorage, network: Network, password: &str) -> anyhow::Result<Self>
     where
         Self: Sized;
 
@@ -502,7 +335,7 @@ impl WalletApi for BMPWallet<Connection> {
         let network = self.network();
         let mut vec = vec![&mut self.wallet];
         let mut imported =
-            Self::load_imported_wallets(&self.imported_keys, &self.db, network, Self::DB_NAME)?;
+            Self::load_imported_wallets(&self.imported_keys, self.db.location(), network)?;
 
         vec.extend(
             imported
@@ -535,7 +368,7 @@ impl WalletApi for BMPWallet<Connection> {
         Ok(())
     }
 
-    fn new(path: &Path, password: &str, network: Network) -> anyhow::Result<Self>
+    fn new(storage: DBStorage, password: &str, network: Network) -> anyhow::Result<Self>
     where
         Self: Sized,
     {
@@ -550,16 +383,9 @@ impl WalletApi for BMPWallet<Connection> {
         let (change_descriptor, internal_map, _) =
             Bip86(xprv, KeychainKind::Internal).build(network.into())?;
 
-        let db_path = path.join(Self::DB_NAME);
-        let db_path = db_path.to_str().expect("Should get path value");
+        let mut db = storage.open(Self::DB_NAME)?;
+        let salt = storage.persist_salt(Self::DB_NAME)?;
 
-        let mut db = Connection::new(db_path)?;
-
-        // Derive encryption key
-        let salt_path = format!("{db_path}.salt");
-        let mut salt = [0u8; 16];
-        rand::rng().fill_bytes(&mut salt);
-        fs::write(&salt_path, general_purpose::STANDARD.encode(salt))?;
         let enc_key = derive_key_from_password(password, &salt)?;
         db.pragma_update(None, "key", enc_key)?;
 
@@ -584,7 +410,7 @@ impl WalletApi for BMPWallet<Connection> {
             imported_keys: vec![],
             imported_balance: Balance::default(),
             signers_loaded: true,
-            db,
+            db: BMPDatabase::new(storage,db),
             last_unused_address: None,
         })
     }
@@ -676,14 +502,9 @@ impl WalletApi for BMPWallet<Connection> {
 
     // For already created wallets this will load stored data
     // This will also load the imported keys
-    fn load_wallet(path: &Path, network: Network, password: &str) -> anyhow::Result<Self> {
-        let (salt, mut db) = {
-            let p = path.join(Self::DB_NAME);
-            (
-                get_salt(p.to_str().expect("Path must not be empty"))?,
-                Connection::open(p)?,
-            )
-        };
+    fn load_wallet(storage: DBStorage, network: Network, password: &str) -> anyhow::Result<Self> {
+        let salt = storage.load_salt(Self::DB_NAME)?;
+        let mut db = storage.open(Self::DB_NAME)?;
 
         let decrypt_key = derive_key_from_password(password, &salt)?;
         db.pragma_update(None, "key", decrypt_key)?;
@@ -699,7 +520,7 @@ impl WalletApi for BMPWallet<Connection> {
                 imported_keys,
                 imported_balance: Balance::default(),
                 signers_loaded: false,
-                db,
+                db: BMPDatabase::new(storage, db),
                 last_unused_address: None,
             });
         }

@@ -44,7 +44,7 @@ pub fn funded_wallet(env: &mut TestEnv) -> BoxedTradeWallet {
 
 fn funded_bmp_wallet(env: &mut TestEnv) -> BMPWallet<Connection> {
     let mut wallet =
-        BMPWallet::<Connection>::new(env.new_temp_path(), "", Network::Regtest).unwrap();
+        BMPWallet::<Connection>::new(env.new_temp_path().into(), "", Network::Regtest).unwrap();
 
     let address = wallet.get_new_address().unwrap();
     let txid = env
@@ -375,7 +375,8 @@ fn imported_payout_key_matches_deposit_payout_descriptor() {
 
     let dir = std::env::temp_dir().join(format!("bmp-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let mut w = BMPWallet::<Connection>::new(&dir, "", Network::Regtest).unwrap();
+
+    let mut w = BMPWallet::<Connection>::new(dir.as_path().into(), "", Network::Regtest).unwrap();
     let trade_wallet: &mut dyn ProtocolWalletApi = &mut w;
     trade_wallet
         .import_private_key(

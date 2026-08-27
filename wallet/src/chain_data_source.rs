@@ -5,7 +5,7 @@ use bdk_wallet::chain::DescriptorExt as _;
 use bdk_wallet::{KeychainKind, PersistedWallet};
 use chain::CBFScanner;
 
-use crate::bmp_wallet::BMPWalletPersister;
+use crate::persisted::BMPWalletPersister;
 
 #[trait_variant::make(Send)]
 pub trait ChainDataSource {
