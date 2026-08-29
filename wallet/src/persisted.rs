@@ -72,11 +72,12 @@ impl DBStorage {
                 Ok(salt.to_vec())
             }
             Self::Memory(name) => {
-                let v = MEMORY_SALT_STORE
+                MEMORY_SALT_STORE
                     .lock()
                     .unwrap()
-                    .insert(name.clone(), salt.to_vec());
-                Ok(v.unwrap())
+                    .entry(name.clone())
+                    .insert_entry(salt.to_vec());
+                Ok(salt.to_vec())
             }
         }
     }
@@ -113,7 +114,7 @@ impl<C: BMPWalletPersister> BMPDatabase<C> {
         Self { storage, conn }
     }
 
-    pub const fn location(&self) -> &DBStorage {
+    pub const fn storage(&self) -> &DBStorage {
         &self.storage
     }
 }

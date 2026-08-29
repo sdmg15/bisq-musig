@@ -202,7 +202,7 @@ impl BMPWallet<Connection> {
         self.wallet.build_tx().coin_selection(coin_selection)
     }
 
-    fn load_imported_wallets(
+    pub(crate) fn load_imported_wallets(
         imported_keys: &[ImportedKey],
         storage: &DBStorage,
         network: Network,
@@ -335,7 +335,7 @@ impl WalletApi for BMPWallet<Connection> {
         let network = self.network();
         let mut vec = vec![&mut self.wallet];
         let mut imported =
-            Self::load_imported_wallets(&self.imported_keys, self.db.location(), network)?;
+            Self::load_imported_wallets(&self.imported_keys, self.db.storage(), network)?;
 
         vec.extend(
             imported

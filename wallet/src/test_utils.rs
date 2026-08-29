@@ -1,4 +1,3 @@
-use std::path::Path;
 use std::str::FromStr as _;
 
 use bdk_wallet::bitcoin::hashes::Hash as _;
@@ -7,17 +6,19 @@ use bdk_wallet::bitcoin::key::{Keypair, Secp256k1, TapTweak as _};
 use bdk_wallet::bitcoin::secp256k1::{Message, schnorr};
 use bdk_wallet::bitcoin::sighash::{Prevouts, SighashCache};
 use bdk_wallet::bitcoin::{
-    Amount, BlockHash, Network, OutPoint, PrivateKey, ScriptBuf, Sequence, TapSighashType,
+    Amount, BlockHash, OutPoint, PrivateKey, ScriptBuf, Sequence, TapSighashType,
     Transaction, TxOut, Weight, Witness, XOnlyPublicKey, psbt,
 };
 use bdk_wallet::chain::{BlockId, ChainPosition, ConfirmationBlockTime};
 use bdk_wallet::rusqlite::Connection;
 use bdk_wallet::test_utils::{insert_checkpoint, receive_output_in_latest_block};
-use bdk_wallet::{KeychainKind, LocalOutput, PersistedWallet, Utxo, Wallet, WeightedUtxo};
+use bdk_wallet::{KeychainKind, LocalOutput, PersistedWallet, Utxo, WeightedUtxo};
+use rand::RngCore as _;
 use secp::Scalar;
 
+use crate::bmp_wallet::ImportedKey;
 use crate::chain_data_source::ChainDataSource;
-use crate::persisted::BMPWalletPersister;
+use crate::persisted::{BMPWalletPersister, DBStorage};
 
 pub struct MockedBDKElectrum;
 
@@ -88,20 +89,6 @@ pub fn verify_signature(
     Ok(())
 }
 
-pub fn load_imported_wallet(p: &Path, key: &Scalar) -> anyhow::Result<PersistedWallet<Connection>> {
-    let pbk = key.base_point_mul();
-    let pubkey = pbk.serialize_xonly().to_lower_hex_string();
-    let db_path = format!("bmp_{pubkey}.db3");
-    let db_path = p.join(db_path);
-
-    let mut db = Connection::open(db_path)?;
-    let imported_wallet_opt = Wallet::load()
-        .check_network(Network::Regtest)
-        .extract_keys()
-        .load_wallet(&mut db)?;
-
-    Ok(imported_wallet_opt.unwrap())
-}
 
 pub fn derive_public_key(key: &Scalar) -> XOnlyPublicKey {
     let xonly_pubkey = key.base_point_mul().serialize_xonly();
@@ -178,3 +165,33 @@ pub fn local_utxo(
         }),
     }
 }
+
+pub struct MemDbHandle {
+    pub store: DBStorage,
+    anchors: Vec<Connection>, // keeps every shared-cache DB (main + imported-key siblings) alive
+}
+
+impl MemDbHandle {
+    pub fn new() -> anyhow::Result<Self> {
+        let mut seed = [0u8; 10];
+        rand::rng().fill_bytes(&mut seed);
+        let name = format!("bmp_test_{}", seed.to_lower_hex_string());
+        let store = DBStorage::Memory(name.clone());
+        let anchor = store.open(&name)?;
+        Ok(Self { store, anchors: vec![anchor] })
+    }
+    
+    /// Pin the shared-cache DB for an imported key's sub-wallet so it
+    /// survives connections opening/closing around it.
+    pub fn anchor_imported_key(&mut self, key: &ImportedKey) -> anyhow::Result<()> {
+        let db_file = match key.merkle_root() {
+                None => format!("bmp_{}.db3", key.internal_key()),
+                Some(root) => format!("bmp_{}_{}.db3", key.internal_key(), root),
+        };
+
+        let sibling_location = self.store.sibling(&db_file);
+        self.anchors.push(sibling_location.open(&db_file)?);
+        Ok(())
+    }
+}
+
