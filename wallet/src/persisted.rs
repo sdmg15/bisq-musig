@@ -13,7 +13,7 @@ use secp::Scalar;
 use crate::bmp_wallet::ImportedKey;
 use crate::utils::get_salt;
 
-// #[cfg(any(test, feature = "test-utils"))]
+#[cfg(any(test, feature = "test-utils"))]
 static MEMORY_SALT_STORE: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>,
 > = std::sync::LazyLock::new(Default::default);
@@ -25,6 +25,7 @@ static MEMORY_SALT_STORE: std::sync::LazyLock<
 #[non_exhaustive]
 pub enum DBStorage {
     File(PathBuf),
+    #[cfg(any(test, feature = "test-utils"))]
     Memory(String),
 }
 
@@ -33,14 +34,20 @@ impl DBStorage {
     #[must_use]
     pub fn sibling(&self, file_name: &str) -> Self {
         match self {
-            Self::File(path) => Self::File(path.clone()),
+            Self::File(path) => {
+                tracing::debug!("Ignoring argument {file_name}");
+                Self::File(path.clone())
+            }
+            #[cfg(any(test, feature = "test-utils"))]
             Self::Memory(name) => Self::Memory(format!("{name}_{file_name}")),
         }
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
     fn open_uri(&self) -> String {
         match self {
             Self::File(path) => path.to_string_lossy().into_owned(),
+            #[cfg(any(test, feature = "test-utils"))]
             Self::Memory(name) => format!("file:{name}?mode=memory&cache=shared"),
         }
     }
@@ -51,6 +58,7 @@ impl DBStorage {
                 let path = path.join(db_name);
                 Connection::open(path)
             }
+            #[cfg(any(test, feature = "test-utils"))]
             Self::Memory(_) => Connection::open_with_flags(
                 self.open_uri(),
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -71,6 +79,7 @@ impl DBStorage {
                 fs::write(full_p, general_purpose::STANDARD.encode(salt))?;
                 Ok(salt.to_vec())
             }
+            #[cfg(any(test, feature = "test-utils"))]
             Self::Memory(name) => {
                 MEMORY_SALT_STORE
                     .lock()
@@ -88,6 +97,7 @@ impl DBStorage {
                 let salt_path = path.join(db_name);
                 get_salt(&salt_path.display().to_string())
             }
+            #[cfg(any(test, feature = "test-utils"))]
             Self::Memory(name) => MEMORY_SALT_STORE
                 .lock()
                 .unwrap()
