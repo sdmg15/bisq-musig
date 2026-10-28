@@ -65,7 +65,7 @@ pub trait ProtocolWalletApi {
     ) -> Result<()>;
 
     fn lock_utxo(&mut self, utxo: OutPoint) -> Result<()>;
-    fn list_locked_utxos(&self) -> Result<Vec<OutPoint>>;
+    fn list_locked_utxos(&self) -> Vec<OutPoint>;
     fn unlock_utxo(&mut self, utxo: OutPoint) -> Result<()>;
     fn is_utxo_locked(&self, utxo: OutPoint) -> bool;
 }
@@ -221,8 +221,8 @@ impl ProtocolWalletApi for MemWallet {
         Ok(())
     }
 
-    fn list_locked_utxos(&self) -> Result<Vec<OutPoint>> {
-        Ok(self.wallet.list_locked_outpoints().collect())
+    fn list_locked_utxos(&self) -> Vec<OutPoint> {
+        self.wallet.list_locked_outpoints().collect()
     }
 
     fn unlock_utxo(&mut self, utxo: OutPoint) -> Result<()> {
@@ -287,8 +287,8 @@ impl ProtocolWalletApi for Wallet {
         Ok(())
     }
 
-    fn list_locked_utxos(&self) -> Result<Vec<OutPoint>> {
-        Ok(self.list_locked_outpoints().collect())
+    fn list_locked_utxos(&self) -> Vec<OutPoint> {
+        self.list_locked_unspent().collect()
     }
 
     fn unlock_utxo(&mut self, utxo: OutPoint) -> Result<()> {
@@ -299,6 +299,7 @@ impl ProtocolWalletApi for Wallet {
     fn is_utxo_locked(&self, utxo: OutPoint) -> bool {
         self.is_outpoint_locked(utxo)
     }
+    // @TODO Add a new method, locked_balance
 }
 
 /// Sign the wallet-owned inputs of `psbt` using the supplied `sign` closure, then transfer the

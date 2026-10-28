@@ -780,8 +780,11 @@ mod tests {
         wallet.lock_utxo(owned_outpoint)?;
         drop(wallet);
 
-        let reloaded =
-            BMPWallet::load_wallet(mem_storage.store, Network::Regtest, &test_password())?;
+        let mut reloaded = BMPWallet::load_wallet(
+            mem_storage.store.clone(),
+            Network::Regtest,
+            &test_password(),
+        )?;
 
         assert!(reloaded.is_utxo_locked(imported_outpoint));
         assert!(reloaded.is_utxo_locked(owned_outpoint));
@@ -798,6 +801,57 @@ mod tests {
                 .iter()
                 .find(|utxo| OutPoint::new(utxo.tx_id, utxo.vout) == owned_outpoint)
                 .is_some_and(|utxo| utxo.is_locked)
+        );
+
+        // Unlocking immediately makes the imported outpoint eligible for coin selection again.
+        reloaded.unlock_utxo(imported_outpoint)?;
+        assert!(!reloaded.is_utxo_locked(imported_outpoint));
+
+        let mut builder = reloaded.build_tx();
+        builder
+            .fee_rate(FeeRate::from_sat_per_kwu(250))
+            .add_recipient(ScriptBuf::default(), Amount::from_sat(50_000_000));
+        let psbt = builder.finish()?;
+        assert!(
+            psbt.unsigned_tx
+                .input
+                .iter()
+                .any(|input| input.previous_output == imported_outpoint)
+        );
+
+        // Persist both unlocks, reload, and verify the unlocked state and selection behavior.
+        reloaded.unlock_utxo(owned_outpoint)?;
+        drop(reloaded);
+
+        let mut reloaded =
+            BMPWallet::load_wallet(mem_storage.store, Network::Regtest, &test_password())?;
+        assert!(!reloaded.is_utxo_locked(imported_outpoint));
+        assert!(!reloaded.is_utxo_locked(owned_outpoint));
+
+        let mut builder = reloaded.build_tx();
+        builder
+            .fee_rate(FeeRate::from_sat_per_kwu(250))
+            .add_recipient(ScriptBuf::default(), Amount::from_sat(50_000_000));
+        let psbt = builder.finish()?;
+        assert!(
+            psbt.unsigned_tx
+                .input
+                .iter()
+                .any(|input| input.previous_output == imported_outpoint)
+        );
+
+        // The owned outpoint is selectable too when the imported one is locked.
+        reloaded.lock_utxo(imported_outpoint)?;
+        let mut builder = reloaded.build_tx();
+        builder
+            .fee_rate(FeeRate::from_sat_per_kwu(250))
+            .add_recipient(ScriptBuf::default(), Amount::from_sat(50_000_000));
+        let psbt = builder.finish()?;
+        assert!(
+            psbt.unsigned_tx
+                .input
+                .iter()
+                .any(|input| input.previous_output == owned_outpoint)
         );
 
         Ok(())
@@ -854,6 +908,36 @@ mod tests {
         assert_eq!(tx.input.len(), 2);
         assert_eq!(tx.output.len(), 1);
         assert_eq!(tx.output[0].value, Amount::from_str("1.99983150 BTC")?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn drain_imported_balance_preserves_locked_imported_coins() -> anyhow::Result<()> {
+        let mem_storage = MemDbHandle::new()?;
+        let mut wallet = BMPWallet::new(mem_storage.store, &test_password(), Network::Regtest)?;
+        wallet.import_private_key(new_private_key(), None)?;
+        wallet.import_private_key(new_private_key(), None)?;
+        wallet.sync_all(&MockedBDKElectrum {}).await?;
+
+        let locked = wallet
+            .list_utxos()
+            .into_iter()
+            .find(|utxo| utxo.imported)
+            .expect("sync should provide an imported UTXO");
+        let locked_outpoint = OutPoint::new(locked.tx_id, locked.vout);
+        wallet.lock_utxo(locked_outpoint)?;
+
+        let psbt = wallet.drain_imported_balance(FeeRate::from_sat_per_kwu(25_000))?;
+
+        assert_eq!(psbt.unsigned_tx.input.len(), 1);
+        assert!(
+            psbt.unsigned_tx
+                .input
+                .iter()
+                .all(|input| input.previous_output != locked_outpoint)
+        );
+        assert_eq!(wallet.imported_balance().trusted_spendable(), locked.amount);
 
         Ok(())
     }

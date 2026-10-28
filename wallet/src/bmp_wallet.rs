@@ -335,7 +335,7 @@ impl BMPWallet {
     /// they are therefore always reported with `num_confirmations == 0`. Ones the graph already
     /// knows to be spent are dropped, so this stays consistent with [`Self::full_balance`].
     pub fn list_utxos(&self) -> Vec<UtxoInfo> {
-        let own = self.wallet.list_unspent().map(|utxo| {
+        let own = self.list_unspent().map(|utxo| {
             let block_height = match utxo.chain_position {
                 ChainPosition::Confirmed { anchor, .. } => Some(anchor.block_id.height),
                 ChainPosition::Unconfirmed { .. } => None,
@@ -666,8 +666,8 @@ impl ProtocolWalletApi for BMPWallet {
         self.import_private_key(pk, tap_tree)
     }
 
-    fn list_locked_utxos(&self) -> Result<Vec<OutPoint>> {
-        Ok(self.wallet.list_locked_outpoints().collect())
+    fn list_locked_utxos(&self) -> Vec<OutPoint> {
+        self.wallet.list_locked_outpoints().collect()
     }
 
     fn lock_utxo(&mut self, utxo: OutPoint) -> Result<()> {
@@ -938,44 +938,54 @@ impl WalletApi for BMPWallet {
 
     fn drain_imported_balance(&mut self, fee_rate: FeeRate) -> Result<Psbt> {
         let drain_to_address = self.next_address(KeychainKind::Internal)?;
-        let imported_balance = self.imported_balance.trusted_spendable();
-
         let imported_utxos = self.imported_utxos();
+        let imported_amount: Amount = imported_utxos
+            .iter()
+            .map(|utxo| utxo.utxo.txout().value)
+            .sum();
         let cs = SpendImportedOnly(imported_utxos.clone());
 
         let mut tx_builder = self.build_tx().coin_selection(cs);
 
         tx_builder
             .fee_rate(fee_rate)
-            .add_recipient(drain_to_address.script_pubkey(), imported_balance);
+            .add_recipient(drain_to_address.script_pubkey(), imported_amount);
 
-        match tx_builder.finish() {
-            Err(e) => match e {
-                bdk_wallet::error::CreateTxError::CoinSelection(insufficient_funds) => {
-                    let cs = SpendImportedOnly(imported_utxos);
-                    let fees = insufficient_funds.needed - insufficient_funds.available;
-                    let amount_to_send = imported_balance - fees;
-                    let mut new_builder = self.build_tx().coin_selection(cs);
-                    new_builder
-                        .fee_rate(fee_rate)
-                        .add_recipient(drain_to_address.script_pubkey(), amount_to_send);
+        let psbt = match tx_builder.finish() {
+            Err(bdk_wallet::error::CreateTxError::CoinSelection(insufficient_funds)) => {
+                let cs = SpendImportedOnly(imported_utxos);
+                let fees = insufficient_funds.needed - insufficient_funds.available;
+                let amount_to_send = imported_amount - fees;
+                let mut new_builder = self.build_tx().coin_selection(cs);
+                new_builder
+                    .fee_rate(fee_rate)
+                    .add_recipient(drain_to_address.script_pubkey(), amount_to_send);
+                new_builder.finish()?
+            }
+            Err(e) => return Err(e.into()),
+            Ok(psbt) => psbt,
+        };
 
-                    let psbt = new_builder.finish()?;
-                    self.imported_balance = Balance::default();
+        let spent_amount: Amount = psbt
+            .inputs
+            .iter()
+            .map(|input| {
+                input
+                    .witness_utxo
+                    .as_ref()
+                    .expect("drain PSBT inputs must include witness UTXOs")
+                    .value
+            })
+            .sum();
+        self.imported_balance.confirmed -= spent_amount;
 
-                    tracing::debug!(
-                        "AMOUNT TO SEND {}, fees {}, imported balance {}",
-                        amount_to_send,
-                        fees,
-                        self.imported_balance
-                    );
+        tracing::debug!(
+            "spent imported amount {}, remaining imported balance {}",
+            spent_amount,
+            self.imported_balance
+        );
 
-                    Ok(psbt)
-                }
-                _ => Err(e.into()),
-            },
-            Ok(psbt) => Ok(psbt),
-        }
+        Ok(psbt)
     }
 }
 
