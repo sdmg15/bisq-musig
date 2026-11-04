@@ -667,7 +667,7 @@ impl ProtocolWalletApi for BMPWallet {
     }
 
     fn list_locked_utxos(&self) -> Vec<OutPoint> {
-        self.wallet.list_locked_outpoints().collect()
+        self.wallet.list_locked_unspent().collect()
     }
 
     fn lock_utxo(&mut self, utxo: OutPoint) -> Result<()> {
@@ -955,7 +955,12 @@ impl WalletApi for BMPWallet {
             Err(bdk_wallet::error::CreateTxError::CoinSelection(insufficient_funds)) => {
                 let cs = SpendImportedOnly(imported_utxos);
                 let fees = insufficient_funds.needed - insufficient_funds.available;
-                let amount_to_send = imported_amount - fees;
+                let Some(amount_to_send) = imported_amount.checked_sub(fees) else {
+                    return Err(
+                        bdk_wallet::error::CreateTxError::CoinSelection(insufficient_funds)
+                            .into(),
+                    );
+                };
                 let mut new_builder = self.build_tx().coin_selection(cs);
                 new_builder
                     .fee_rate(fee_rate)
@@ -977,7 +982,11 @@ impl WalletApi for BMPWallet {
                     .value
             })
             .sum();
-        self.imported_balance.confirmed -= spent_amount;
+        self.imported_balance.confirmed = self
+            .imported_balance
+            .confirmed
+            .checked_sub(spent_amount)
+            .unwrap_or_default();
 
         tracing::debug!(
             "spent imported amount {}, remaining imported balance {}",

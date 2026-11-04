@@ -943,6 +943,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn drain_imported_balance_returns_insufficient_funds_when_fee_exceeds_amount()
+    -> anyhow::Result<()> {
+        let mem_storage = MemDbHandle::new()?;
+        let mut wallet = BMPWallet::new(mem_storage.store, &test_password(), Network::Regtest)?;
+        wallet.import_private_key(new_private_key(), None)?;
+        wallet.sync_all(&MockedBDKElectrum {}).await?;
+
+        let err = wallet
+            .drain_imported_balance(FeeRate::from_sat_per_kwu(1_000_000_000))
+            .expect_err("fees exceeding the imported amount must not panic");
+
+        assert!(matches!(
+            err,
+            WalletErrorKind::CreateTx(bdk_wallet::error::CreateTxError::CoinSelection(_))
+        ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_wallet_with_path_creation() -> anyhow::Result<()> {
         let mem_storage_one = MemDbHandle::new()?;
 
